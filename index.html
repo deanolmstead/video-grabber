@@ -69,13 +69,6 @@
   }
   button:hover{background:var(--accent-dark)}
   button:disabled{opacity:.55;cursor:wait}
-  button.secondary{
-    background:var(--panel-2);
-    border:1px solid var(--border);
-    color:var(--text);
-    font-weight:600;
-  }
-  button.secondary:hover{border-color:var(--muted)}
   #status{margin-top:1.1rem;min-height:1.5em;color:var(--muted)}
   #status.err{color:var(--err)}
   #status.ok{color:var(--ok)}
@@ -130,8 +123,8 @@
     <h2>What works, what doesn't</h2>
     <ul>
       <li><strong>Works:</strong> direct video files (.mp4, .webm, .mov) and pages that embed a plain video file — news clips, product videos, blog posts, most smaller sites.</li>
-      <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix and other streaming services. They never expose a plain video file, so there's nothing here to grab.</li>
-      <li>Some sites block other sites from reading their pages. If that happens, the tool tries a couple of relay services, and as a last resort opens the video so you can save it from your browser (right-click → “Save video as…”).</li>
+      <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix, Facebook, Instagram, TikTok and other streaming/social services. They never expose a plain video file, so there's nothing here to grab.</li>
+      <li>Most sites block other sites from reading their pages, so this tool reads through several public relay services at once and uses whichever gets through. If every relay is blocked or busy, wait a minute and try again — or paste the video's direct file link, which always works.</li>
       <li>Only download videos you have the right to keep.</li>
     </ul>
   </div>
@@ -143,6 +136,11 @@
 (function(){
   "use strict";
   var MEDIA_EXT = ["mp4","webm","mov","m4v","mp3","m4a","wav","ogg","opus"];
+  var STREAMING_HOSTS = [
+    "youtube.com","youtu.be","vimeo.com","netflix.com","facebook.com","fb.watch",
+    "instagram.com","tiktok.com","twitter.com","x.com","twitch.tv","dailymotion.com",
+    "hulu.com","disneyplus.com","max.com","primevideo.com","amazon.com"
+  ];
   var input = document.getElementById("url");
   var goBtn = document.getElementById("go");
   var statusEl = document.getElementById("status");
@@ -167,6 +165,13 @@
   }
   function isStream(u){ return extOf(u) === "m3u8"; }
   function isMedia(u){ return MEDIA_EXT.indexOf(extOf(u)) !== -1; }
+  function hostOf(u){
+    try{ return new URL(u).hostname.replace(/^www\./,"").toLowerCase(); }catch(e){ return ""; }
+  }
+  function isStreamingSite(u){
+    var h = hostOf(u);
+    return STREAMING_HOSTS.some(function(s){ return h === s || h.endsWith("." + s); });
+  }
   function filenameFor(u, contentType){
     var name = "";
     try{
@@ -192,32 +197,91 @@
     if(!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = "https://" + u;
     return u;
   }
-  function timeoutFetch(url, ms){
-    var ctrl = new AbortController();
-    var t = setTimeout(function(){ ctrl.abort(); }, ms || 20000);
-    return fetch(url, {signal: ctrl.signal}).finally(function(){ clearTimeout(t); });
-  }
-  // Ways to read a cross-origin URL from the browser: direct first, then relays.
-  function fetchRoutes(url){
+  // Relay services that will fetch a URL on our behalf. Tried in parallel.
+  function relayRoutes(url){
     return [
       url,
+      "https://api.cors.lol/?url=" + encodeURIComponent(url),
       "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
-      "https://corsproxy.io/?url=" + encodeURIComponent(url),
       "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url)
     ];
   }
-  function fetchTextVia(url){
-    var routes = fetchRoutes(url);
-    var chain = Promise.reject(new Error("start"));
-    routes.forEach(function(r){
-      chain = chain.catch(function(){
-        return timeoutFetch(r).then(function(res){
-          if(!res.ok) throw new Error("HTTP " + res.status);
-          return res.text();
+  function textRoutes(url){
+    // Jina's reader returns the page as text/markdown — no HTML tags, but
+    // video file links survive, and the regex scan below can find them.
+    return relayRoutes(url).concat(["https://r.jina.ai/" + url]);
+  }
+  function startFetch(url, ms){
+    var ctrl = new AbortController();
+    var timer = setTimeout(function(){ ctrl.abort(); }, ms);
+    var promise = fetch(url, {signal: ctrl.signal}).then(function(res){
+      clearTimeout(timer);
+      return res;
+    }, function(err){
+      clearTimeout(timer);
+      throw err;
+    });
+    return {promise: promise, abort: function(){ ctrl.abort(); }};
+  }
+  // Race every route; call onResponse(res, abortOthers) for each OK response as
+  // it arrives. Resolves with onResponse's non-undefined return value, or
+  // undefined once every route has failed/finished or the deadline passes.
+  function raceRoutes(routes, deadlineMs, onResponse){
+    return new Promise(function(resolve){
+      var pending = routes.length;
+      var done = false;
+      var handles = routes.map(function(r){ return startFetch(r, deadlineMs); });
+      function finish(val){
+        if(done) return;
+        done = true;
+        handles.forEach(function(h){ try{ h.abort(); }catch(e){} });
+        resolve(val);
+      }
+      var deadline = setTimeout(function(){ finish(undefined); }, deadlineMs);
+      handles.forEach(function(h){
+        h.promise.then(function(res){
+          if(done) return;
+          if(!res.ok){ throw new Error("HTTP " + res.status); }
+          var val = onResponse(res);
+          if(val && typeof val.then === "function"){
+            // A route has committed (e.g. a download is streaming) — the
+            // answer deadline no longer applies; the handler decides.
+            clearTimeout(deadline);
+            val.then(function(v){
+              if(v !== undefined){ clearTimeout(deadline); finish(v); }
+              else if(--pending === 0){ clearTimeout(deadline); finish(undefined); }
+            }, function(){
+              if(--pending === 0){ clearTimeout(deadline); finish(undefined); }
+            });
+          } else if(val !== undefined){
+            clearTimeout(deadline); finish(val);
+          } else if(--pending === 0){
+            clearTimeout(deadline); finish(undefined);
+          }
+        }).catch(function(){
+          if(!done && --pending === 0){ clearTimeout(deadline); finish(undefined); }
         });
       });
+      if(pending === 0) finish(undefined);
     });
-    return chain;
+  }
+  function fetchPage(pageUrl){
+    // Resolve as soon as any route's copy of the page yields a video;
+    // otherwise keep the longest readable copy for the "no video" verdict.
+    var bestText = null;
+    return raceRoutes(textRoutes(pageUrl), 30000, function(res){
+      return res.text().then(function(text){
+        if(!text || text.length < 80) return undefined;
+        if(bestText === null || text.length > bestText.length) bestText = text;
+        var videos = findVideos(text, pageUrl);
+        if(videos.length) return {text: text, videos: videos};
+        return undefined;
+      });
+    }).then(function(hit){
+      if(hit) return hit;
+      if(bestText !== null) return {text: bestText, videos: findVideos(bestText, pageUrl)};
+      return null;
+    });
   }
   function saveBlob(blob, filename){
     var a = document.createElement("a");
@@ -229,7 +293,7 @@
     a.remove();
     setTimeout(function(){ URL.revokeObjectURL(objUrl); }, 4000);
   }
-  function downloadBlobResponse(res, filename){
+  function streamToBlob(res, filename){
     var total = parseInt(res.headers.get("Content-Length") || "0", 10);
     if(!res.body || !total){
       return res.blob().then(function(b){ saveBlob(b, filename); });
@@ -254,32 +318,23 @@
   }
   function download(url){
     var filename = filenameFor(url);
-    setStatus("Downloading " + filename + " …");
+    setStatus("Downloading " + filename + " — trying every route at once …");
     setProgress(0.02);
-    var direct = timeoutFetch(url, 600000).then(function(res){
-      if(!res.ok) throw new Error("HTTP " + res.status);
-      return downloadBlobResponse(res, filenameFor(url, res.headers.get("Content-Type") || ""));
+    // First route to answer with an OK wins; stream the file from it.
+    // (The 30s cap is on getting an answer, not on the download itself.)
+    var saved = raceRoutes(relayRoutes(url), 30000, function(res){
+      var name = filenameFor(url, res.headers.get("Content-Type") || "");
+      return streamToBlob(res, name).then(function(){ return name; });
     });
-    return direct.catch(function(){
-      // Direct read blocked (common — the video's site refuses cross-site reads). Try relays.
-      var routes = fetchRoutes(url).slice(1);
-      var chain = Promise.reject(new Error("start"));
-      routes.forEach(function(r){
-        chain = chain.catch(function(){
-          return timeoutFetch(r, 600000).then(function(res){
-            if(!res.ok) throw new Error("HTTP " + res.status);
-            return downloadBlobResponse(res, filename);
-          });
-        });
-      });
-      return chain;
-    }).then(function(){
+    return saved.then(function(name){
       setProgress(null);
-      setStatus("Saved " + filename + " — check your downloads.", "ok");
-    }).catch(function(){
-      setProgress(null);
-      setStatus("That site wouldn't hand the file over. I opened the video in a new tab — right-click it and choose “Save video as…”.", "err");
+      if(name){
+        setStatus("Saved " + name + " — check your downloads.", "ok");
+        return true;
+      }
+      setStatus("Every route was blocked or busy. Wait a minute and try again — or open the video in your browser and right-click → “Save video as…”. Opening it now.", "err");
       window.open(url, "_blank");
+      return false;
     });
   }
   function addResult(url, source, isMain){
@@ -314,7 +369,7 @@
     resultsEl.appendChild(div);
   }
   function findVideos(html, pageUrl){
-    var found = []; // {url, source, main}
+    var found = [];
     function push(u, source, main){
       if(!u) return;
       try{ u = new URL(u, pageUrl).href; }catch(e){ return; }
@@ -323,34 +378,36 @@
       for(var i=0;i<found.length;i++) if(found[i].url === u) return;
       found.push({url:u, source:source, main:!!main});
     }
-    var doc = new DOMParser().parseFromString(html, "text/html");
-    var metas = [
-      ['meta[property="og:video:secure_url"]', "Page's featured video"],
-      ['meta[property="og:video:url"]', "Page's featured video"],
-      ['meta[property="og:video"]', "Page's featured video"],
-      ['meta[name="twitter:player:stream"]', "Page's featured video"]
-    ];
-    metas.forEach(function(pair){
-      var el = doc.querySelector(pair[0]);
-      if(el) push(el.getAttribute("content"), pair[1], true);
-    });
-    doc.querySelectorAll("video, audio").forEach(function(v){
-      if(v.getAttribute("src")) push(v.getAttribute("src"), "Embedded player", false);
-      v.querySelectorAll("source").forEach(function(s){
-        push(s.getAttribute("src"), "Embedded player", false);
+    if(html.indexOf("<") !== -1){
+      var doc = new DOMParser().parseFromString(html, "text/html");
+      var metas = [
+        ['meta[property="og:video:secure_url"]', "Page's featured video"],
+        ['meta[property="og:video:url"]', "Page's featured video"],
+        ['meta[property="og:video"]', "Page's featured video"],
+        ['meta[name="twitter:player:stream"]', "Page's featured video"]
+      ];
+      metas.forEach(function(pair){
+        var el = doc.querySelector(pair[0]);
+        if(el) push(el.getAttribute("content"), pair[1], true);
       });
-    });
-    doc.querySelectorAll("a[href]").forEach(function(a){
-      var href = a.getAttribute("href");
-      if(href && (isMedia(href) || isStream(href))) push(href, "Link on the page", false);
-    });
-    // Last resort: scan the raw markup for media file URLs (players often hide them in scripts).
+      doc.querySelectorAll("video, audio").forEach(function(v){
+        if(v.getAttribute("src")) push(v.getAttribute("src"), "Embedded player", false);
+        v.querySelectorAll("source").forEach(function(s){
+          push(s.getAttribute("src"), "Embedded player", false);
+        });
+      });
+      doc.querySelectorAll("a[href]").forEach(function(a){
+        var href = a.getAttribute("href");
+        if(href && (isMedia(href) || isStream(href))) push(href, "Link on the page", false);
+      });
+    }
+    // Scan the raw text for media file URLs (players often hide them in
+    // scripts, and text-based copies of the page only have these).
     var re = /https?:\\?\/\\?\/[^\s"'<>\\]+?\.(?:mp4|webm|mov|m4v|m3u8)(?:\?[^\s"'<>\\]*)?/gi;
     var m;
     while((m = re.exec(html)) !== null){
       push(m[0].replace(/\\\//g, "/").replace(/&amp;/g, "&"), "Found in page code", false);
     }
-    // Featured video first, then the rest.
     found.sort(function(a,b){ return (b.main?1:0) - (a.main?1:0); });
     return found;
   }
@@ -360,6 +417,10 @@
     setProgress(null);
     if(!pageUrl){ setStatus("Paste a URL first.", "err"); return; }
     try{ new URL(pageUrl); }catch(e){ setStatus("That doesn't look like a valid URL.", "err"); return; }
+    if(isStreamingSite(pageUrl)){
+      setStatus("That site (" + hostOf(pageUrl) + ") is a streaming/social service — it never exposes a plain video file, so no tool like this can download from it. Sorry.", "err");
+      return;
+    }
     goBtn.disabled = true;
     if(isMedia(pageUrl)){
       setStatus("That's a direct video file — downloading it now.");
@@ -371,22 +432,25 @@
       goBtn.disabled = false;
       return;
     }
-    setStatus("Reading the page and looking for its video …");
-    fetchTextVia(pageUrl).then(function(html){
-      var videos = findVideos(html, pageUrl);
+    setStatus("Reading the page through several relays at once, looking for its video …");
+    fetchPage(pageUrl).then(function(result){
+      if(!result){
+        setStatus("Couldn't read that page — every relay was blocked or busy. Wait a minute and try again. If the video itself has a direct file link, pasting that always works.", "err");
+        return;
+      }
+      var videos = result.videos;
       if(!videos.length){
-        setStatus("No downloadable video found on that page. If the video plays in a player, it may be streamed in pieces rather than one file — or the site blocked the read. A direct link to the video file will always work.", "err");
+        setStatus("Read the page fine, but there's no downloadable video file on it. If the video plays in a player, it's probably streamed in pieces rather than stored as one file.", "err");
         return;
       }
       setStatus("Found " + videos.length + (videos.length === 1 ? " video" : " videos") + " — pick one to download.", "ok");
       videos.forEach(function(v){ addResult(v.url, v.source, v.main); });
       var first = videos.filter(function(v){ return !isStream(v.url); })[0];
       if(videos.length === 1 && first){
-        // Only one candidate — start it right away.
         download(first.url);
       }
     }).catch(function(){
-      setStatus("Couldn't read that page — the site blocked every route in. If you can open the video itself, paste its direct file link instead.", "err");
+      setStatus("Couldn't read that page — every relay was blocked or busy. Wait a minute and try again.", "err");
     }).finally(function(){ goBtn.disabled = false; });
   }
   goBtn.addEventListener("click", run);
