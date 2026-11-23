@@ -124,7 +124,7 @@
     <ul>
       <li><strong>Works:</strong> direct video files (.mp4, .webm, .mov) and pages that embed a plain video file — news clips, product videos, blog posts, most smaller sites.</li>
       <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix, Facebook, Instagram, TikTok and other streaming/social services. They never expose a plain video file, so there's nothing here to grab.</li>
-      <li>Most sites block other sites from reading their pages, so this tool reads through several public relay services at once and uses whichever gets through. If every relay is blocked or busy, wait a minute and try again — or paste the video's direct file link, which always works.</li>
+      <li>Most sites block other sites from reading their pages, so this tool fetches through a small private proxy first, with several public relay services as backup. If every route is blocked or busy, wait a minute and try again — or paste the video's direct file link, which always works.</li>
       <li>Only download videos you have the right to keep.</li>
     </ul>
   </div>
@@ -198,8 +198,10 @@
     return u;
   }
   // Relay services that will fetch a URL on our behalf. Tried in parallel.
+  var PROXY = "https://video-grabber-proxy.deanolmstead.workers.dev/?url=";
   function relayRoutes(url){
     return [
+      PROXY + encodeURIComponent(url),
       url,
       "https://api.cors.lol/?url=" + encodeURIComponent(url),
       "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
@@ -371,6 +373,10 @@
       return fetch(routes[i], {signal: ctrl.signal}).then(function(res){
         clearTimeout(headerTimer);
         if(!res.ok) throw new Error("HTTP " + res.status);
+        // Error pages come back as text with a 200 more often than you'd
+        // think — a real media file never does. Refuse and fail over.
+        var ctype = (res.headers.get("Content-Type") || "").toLowerCase();
+        if(ctype.indexOf("text/") === 0) throw new Error("Not a media file");
         var name = filenameFor(url, res.headers.get("Content-Type") || "");
         return streamWithStallWatch(res, name).then(function(){ return name; });
       }).then(function(name){
