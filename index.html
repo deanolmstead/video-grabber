@@ -85,7 +85,12 @@
     padding:1rem 1.1rem;
     display:flex;gap:1rem;align-items:center;flex-wrap:wrap;
   }
-  .found .meta{flex:1 1 260px;min-width:0}
+  .found .thumb{
+    width:118px;height:66px;flex:0 0 auto;display:none;
+    object-fit:cover;border-radius:8px;background:var(--panel-2);
+    border:1px solid var(--border);
+  }
+  .found .meta{flex:1 1 240px;min-width:0}
   .found .fname{font-weight:700;word-break:break-all}
   .found .furl{color:var(--muted);font-size:.82rem;word-break:break-all}
   .tag{
@@ -122,8 +127,8 @@
   <div class="notes">
     <h2>What works, what doesn't</h2>
     <ul>
-      <li><strong>Works:</strong> direct video files (.mp4, .webm, .mov) and pages that embed a plain video file — news clips, product videos, blog posts, most smaller sites.</li>
-      <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix, Facebook, Instagram, TikTok and other streaming/social services. They never expose a plain video file, so there's nothing here to grab.</li>
+      <li><strong>Works:</strong> direct video files (.mp4, .webm, .mov), pages that embed a plain video file — news clips, product videos, blog posts, most smaller sites — and streamed videos (HLS / .m3u8), which are downloaded in pieces and joined into a single MP4.</li>
+      <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix, Facebook, Instagram, TikTok and other streaming/social services, and DRM-encrypted streams. They never expose a plain video file, so there's nothing here to grab.</li>
       <li>Most sites block other sites from reading their pages, so this tool fetches through a small private proxy first, with several public relay services as backup. If every route is blocked or busy, wait a minute and try again — or paste the video's direct file link, which always works.</li>
       <li>Only download videos you have the right to keep.</li>
     </ul>
@@ -132,6 +137,7 @@
   <footer>Runs entirely in your browser — nothing you paste is stored anywhere.</footer>
 </main>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mux.js/6.3.0/mux.min.js"></script>
 <script>
 (function(){
   "use strict";
@@ -164,7 +170,13 @@
     }catch(e){ return ""; }
   }
   function isStream(u){ return extOf(u) === "m3u8"; }
+  function isDash(u){ return extOf(u) === "mpd"; }
   function isMedia(u){ return MEDIA_EXT.indexOf(extOf(u)) !== -1; }
+  function formatTag(u){
+    if(isStream(u)) return "HLS";
+    if(isDash(u)) return "DASH";
+    return (extOf(u) || "video").toUpperCase();
+  }
   function hostOf(u){
     try{ return new URL(u).hostname.replace(/^www\./,"").toLowerCase(); }catch(e){ return ""; }
   }
@@ -196,6 +208,11 @@
     if(!u) return "";
     if(!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = "https://" + u;
     return u;
+  }
+  function fmtBytes(n){
+    if(n > 1048576) return (n/1048576).toFixed(1) + " MB";
+    if(n > 1024) return Math.round(n/1024) + " KB";
+    return n + " B";
   }
   // Relay services that will fetch a URL on our behalf. Tried in parallel.
   var PROXY = "https://video-grabber-proxy.deanolmstead.workers.dev/?url=";
@@ -295,6 +312,31 @@
       return null;
     });
   }
+  function fetchTextViaRoutes(url){
+    // Small text files (playlists): first route that answers wins.
+    var routes = relayRoutes(url);
+    function attempt(i){
+      if(i >= routes.length) return Promise.reject(new Error("no route"));
+      return startFetch(routes[i], 15000).promise.then(function(res){
+        if(!res.ok) throw new Error("HTTP " + res.status);
+        return res.text();
+      }).catch(function(){ return attempt(i + 1); });
+    }
+    return attempt(0);
+  }
+  function fetchBin(url){
+    // Binary chunks (stream segments, keys): the private proxy first,
+    // then a direct try.
+    var routes = [PROXY + encodeURIComponent(url), url];
+    function attempt(i){
+      if(i >= routes.length) return Promise.reject(new Error("fetch failed"));
+      return startFetch(routes[i], 30000).promise.then(function(res){
+        if(!res.ok) throw new Error("HTTP " + res.status);
+        return res.arrayBuffer();
+      }).catch(function(){ return attempt(i + 1); });
+    }
+    return attempt(0);
+  }
   function saveBlob(blob, filename){
     var a = document.createElement("a");
     var objUrl = URL.createObjectURL(blob);
@@ -389,49 +431,293 @@
     }
     return attempt(0);
   }
-  function addResult(url, source, isMain){
+
+  // ---------- HLS (.m3u8) downloads ----------
+  function parseAttrs(s){
+    var o = {};
+    var re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+    var m;
+    while((m = re.exec(s)) !== null) o[m[1].toUpperCase()] = m[2].replace(/^"|"$/g, "");
+    return o;
+  }
+  function resolveUrl(u, base){
+    try{ return new URL(u, base).href; }catch(e){ return u; }
+  }
+  function seqIv(n){
+    var b = new Uint8Array(16);
+    var x = n;
+    for(var i = 15; i >= 0 && x > 0; i--){ b[i] = x % 256; x = Math.floor(x / 256); }
+    return b;
+  }
+  function hexIv(s){
+    var hex = s.replace(/^0x/i, "");
+    if(hex.length % 2) hex = "0" + hex;
+    var b = new Uint8Array(16);
+    for(var i = 0; i < 16 && i * 2 < hex.length; i++){
+      b[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return b;
+  }
+  function transmuxToMp4(parts){
+    // Join MPEG-TS segments and convert to MP4 with mux.js. Resolves
+    // null when mux.js isn't available (caller falls back to .ts).
+    return new Promise(function(resolve){
+      if(!(window.muxjs && muxjs.mp4 && muxjs.mp4.Transmuxer)){ resolve(null); return; }
+      var out = [];
+      var finished = false;
+      function finish(){ if(!finished){ finished = true; resolve(out.length ? out : null); } }
+      try{
+        var tm = new muxjs.mp4.Transmuxer({keepOriginalTimestamps: true});
+        tm.on("data", function(seg){
+          if(seg.initSegment) out.push(new Uint8Array(seg.initSegment));
+          if(seg.data) out.push(new Uint8Array(seg.data));
+        });
+        tm.on("done", finish);
+        parts.forEach(function(buf){ tm.push(new Uint8Array(buf)); tm.flush(); });
+        setTimeout(finish, 800);
+      }catch(e){ resolve(null); }
+    });
+  }
+  function downloadHls(url){
+    var baseName = filenameFor(url).replace(/\.m3u8$/i, "");
+    if(!/\.(mp4|ts)$/i.test(baseName)) baseName += ".mp4";
+    setProgress(0.02);
+    setStatus("Reading the stream playlist …");
+    return fetchTextViaRoutes(url).then(function(text){
+      if(text.indexOf("#EXTM3U") === -1) throw new Error("not a playlist");
+      var lines = text.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(Boolean);
+      // Master playlist? Pick the highest-bandwidth variant.
+      var variants = [];
+      for(var i = 0; i < lines.length; i++){
+        if(lines[i].indexOf("#EXT-X-STREAM-INF") === 0){
+          var attrs = parseAttrs(lines[i].substring(lines[i].indexOf(":") + 1));
+          var vUrl = "";
+          for(var j = i + 1; j < lines.length; j++){
+            if(lines[j].charAt(0) !== "#"){ vUrl = lines[j]; break; }
+          }
+          if(vUrl) variants.push({
+            url: resolveUrl(vUrl, url),
+            bandwidth: parseInt(attrs.BANDWIDTH || "0", 10),
+            resolution: attrs.RESOLUTION || ""
+          });
+        }
+      }
+      if(variants.length){
+        variants.sort(function(a, b){ return b.bandwidth - a.bandwidth; });
+        var best = variants[0];
+        setStatus("Stream has " + variants.length + " qualities — taking the best" +
+          (best.resolution ? " (" + best.resolution + ")" : "") + " …");
+        return fetchTextViaRoutes(best.url).then(function(t){
+          return {text: t, base: best.url};
+        });
+      }
+      return {text: text, base: url};
+    }).then(function(pl){
+      var lines = pl.text.split(/\r?\n/).map(function(l){ return l.trim(); }).filter(Boolean);
+      var segments = [];
+      var initUri = null;
+      var keyInfo = null;
+      var mediaSeq = 0;
+      lines.forEach(function(line){
+        if(line.indexOf("#EXT-X-MEDIA-SEQUENCE:") === 0){
+          mediaSeq = parseInt(line.substring(22), 10) || 0;
+        } else if(line.indexOf("#EXT-X-MAP:") === 0){
+          var ma = parseAttrs(line.substring(11));
+          if(ma.URI) initUri = resolveUrl(ma.URI, pl.base);
+        } else if(line.indexOf("#EXT-X-KEY:") === 0){
+          keyInfo = parseAttrs(line.substring(11));
+        } else if(line.charAt(0) !== "#"){
+          segments.push(resolveUrl(line, pl.base));
+        }
+      });
+      if(!segments.length) throw new Error("no segments");
+      if(keyInfo && keyInfo.METHOD && keyInfo.METHOD !== "NONE" && keyInfo.METHOD !== "AES-128"){
+        setProgress(null);
+        setStatus("That stream is DRM-encrypted (" + keyInfo.METHOD + ") — it can't be saved by any tool like this.", "err");
+        return false;
+      }
+      var total = segments.length;
+      var parts = new Array(total);
+      var doneCount = 0;
+      var bytes = 0;
+      var next = 0;
+      function work(){
+        if(next >= total) return Promise.resolve();
+        var idx = next++;
+        return fetchBin(segments[idx]).then(function(buf){
+          parts[idx] = buf;
+          doneCount++;
+          bytes += buf.byteLength;
+          setProgress(0.05 + 0.9 * (doneCount / total));
+          setStatus("Downloading stream — piece " + doneCount + " of " + total +
+            " (" + fmtBytes(bytes) + ") …");
+        }).then(work);
+      }
+      var workers = [];
+      for(var w = 0; w < 4; w++) workers.push(work());
+      return Promise.all(workers).then(function(){
+        var chain = Promise.resolve(parts);
+        if(keyInfo && keyInfo.METHOD === "AES-128" && keyInfo.URI){
+          setStatus("Decrypting the stream …");
+          var keyUrl = resolveUrl(keyInfo.URI, pl.base);
+          chain = fetchBin(keyUrl).then(function(keyBuf){
+            return crypto.subtle.importKey("raw", keyBuf, {name: "AES-CBC"}, false, ["decrypt"])
+              .then(function(key){
+                var dec = Promise.resolve();
+                var out = new Array(total);
+                parts.forEach(function(buf, i){
+                  dec = dec.then(function(){
+                    var iv = keyInfo.IV ? hexIv(keyInfo.IV) : seqIv(mediaSeq + i);
+                    return crypto.subtle.decrypt({name: "AES-CBC", iv: iv}, key, buf)
+                      .then(function(plain){ out[i] = plain; });
+                  });
+                });
+                return dec.then(function(){ return out; });
+              });
+          });
+        }
+        return chain.then(function(plainParts){
+          setProgress(0.97);
+          if(initUri){
+            // Already MP4 (fragmented) — just join init + pieces.
+            setStatus("Joining the pieces …");
+            return fetchBin(initUri).then(function(initBuf){
+              var all = [initBuf].concat(plainParts);
+              saveBlob(new Blob(all, {type: "video/mp4"}), baseName.replace(/\.ts$/i, ".mp4"));
+              setProgress(null);
+              setStatus("Saved " + baseName.replace(/\.ts$/i, ".mp4") + " — check your downloads.", "ok");
+              return true;
+            });
+          }
+          setStatus("Joining the pieces into one MP4 …");
+          return transmuxToMp4(plainParts).then(function(mp4Parts){
+            if(mp4Parts){
+              saveBlob(new Blob(mp4Parts, {type: "video/mp4"}), baseName.replace(/\.ts$/i, ".mp4"));
+              setProgress(null);
+              setStatus("Saved " + baseName.replace(/\.ts$/i, ".mp4") + " — check your downloads.", "ok");
+            } else {
+              var tsName = baseName.replace(/\.mp4$/i, ".ts");
+              saveBlob(new Blob(plainParts, {type: "video/mp2t"}), tsName);
+              setProgress(null);
+              setStatus("Saved " + tsName + " — the MP4 converter didn't load, so this is the raw stream file. It plays in VLC and most players.", "ok");
+            }
+            return true;
+          });
+        });
+      });
+    }).catch(function(){
+      setProgress(null);
+      setStatus("Couldn't download that stream — the playlist or its pieces were blocked on every route. Wait a minute and try again.", "err");
+      return false;
+    });
+  }
+
+  // ---------- Results list ----------
+  function grabFrame(url, img){
+    // No poster or page image? Pull a frame from the video itself,
+    // streamed through the proxy, and use it as the thumbnail.
+    var v = document.createElement("video");
+    var done = false;
+    var timer = setTimeout(cleanup, 12000);
+    function cleanup(){
+      if(done) return;
+      done = true;
+      clearTimeout(timer);
+      try{ v.removeAttribute("src"); v.load(); }catch(e){}
+    }
+    v.muted = true;
+    v.preload = "auto";
+    v.crossOrigin = "anonymous";
+    v.addEventListener("loadeddata", function(){
+      try{ v.currentTime = Math.min(1, (v.duration || 2) / 2); }catch(e){ cleanup(); }
+    });
+    v.addEventListener("seeked", function(){
+      try{
+        var vw = v.videoWidth, vh = v.videoHeight;
+        if(vw && vh){
+          var c = document.createElement("canvas");
+          c.width = 160; c.height = 90;
+          var ctx = c.getContext("2d");
+          var scale = Math.max(160 / vw, 90 / vh);
+          var w = vw * scale, h = vh * scale;
+          ctx.drawImage(v, (160 - w) / 2, (90 - h) / 2, w, h);
+          img.src = c.toDataURL("image/jpeg", 0.7);
+          img.style.display = "block";
+        }
+      }catch(e){}
+      cleanup();
+    });
+    v.addEventListener("error", cleanup);
+    v.src = PROXY + encodeURIComponent(url);
+  }
+  function addResult(item, pageThumb){
+    var url = item.url;
     var div = document.createElement("div");
     div.className = "found";
+    var img = document.createElement("img");
+    img.className = "thumb";
+    img.alt = "";
+    var thumb = item.thumb || pageThumb || "";
+    if(thumb){
+      img.src = thumb;
+      img.style.display = "block";
+      img.onerror = function(){ img.style.display = "none"; };
+    }
+    div.appendChild(img);
     var meta = document.createElement("div");
     meta.className = "meta";
     var fname = document.createElement("div");
     fname.className = "fname";
     var tag = document.createElement("span");
-    tag.className = "tag" + (isMain ? " main" : "");
-    tag.textContent = (extOf(url) || "video").toUpperCase();
+    tag.className = "tag" + (item.main ? " main" : "");
+    tag.textContent = formatTag(url);
     fname.appendChild(tag);
     fname.appendChild(document.createTextNode(filenameFor(url)));
     var furl = document.createElement("div");
     furl.className = "furl";
-    furl.textContent = source + " — " + url;
+    furl.textContent = item.source + " — " + url;
     meta.appendChild(fname);
     meta.appendChild(furl);
     div.appendChild(meta);
-    if(isStream(url)){
+    if(isDash(url)){
       var note = document.createElement("span");
       note.style.color = "var(--warn)";
-      note.textContent = "Live stream format — can't be saved as a single file here.";
+      note.textContent = "DASH stream — not supported yet.";
       div.appendChild(note);
     } else {
       var btn = document.createElement("button");
       btn.textContent = "Download";
-      btn.addEventListener("click", function(){ download(url); });
+      btn.addEventListener("click", function(){
+        if(isStream(url)) downloadHls(url);
+        else download(url);
+      });
       div.appendChild(btn);
+      if(!thumb && isMedia(url)) grabFrame(url, img);
     }
     resultsEl.appendChild(div);
   }
   function findVideos(html, pageUrl){
     var found = [];
-    function push(u, source, main){
+    var pageThumb = "";
+    function push(u, source, main, thumb){
       if(!u) return;
       try{ u = new URL(u, pageUrl).href; }catch(e){ return; }
       if(!/^https?:/i.test(u)) return;
-      if(!isMedia(u) && !isStream(u) && !main) return;
-      for(var i=0;i<found.length;i++) if(found[i].url === u) return;
-      found.push({url:u, source:source, main:!!main});
+      if(!isMedia(u) && !isStream(u) && !isDash(u) && !main) return;
+      for(var i = 0; i < found.length; i++){
+        if(found[i].url === u){
+          if(thumb && !found[i].thumb) found[i].thumb = thumb;
+          return;
+        }
+      }
+      found.push({url: u, source: source, main: !!main, thumb: thumb || ""});
     }
     if(html.indexOf("<") !== -1){
       var doc = new DOMParser().parseFromString(html, "text/html");
+      var ogImg = doc.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
+      if(ogImg && ogImg.getAttribute("content")){
+        try{ pageThumb = new URL(ogImg.getAttribute("content"), pageUrl).href; }catch(e){}
+      }
       var metas = [
         ['meta[property="og:video:secure_url"]', "Page's featured video"],
         ['meta[property="og:video:url"]', "Page's featured video"],
@@ -442,25 +728,54 @@
         var el = doc.querySelector(pair[0]);
         if(el) push(el.getAttribute("content"), pair[1], true);
       });
+      // Structured data often names the real file (and a thumbnail).
+      doc.querySelectorAll('script[type="application/ld+json"]').forEach(function(s){
+        try{
+          var data = JSON.parse(s.textContent);
+          var objs = [];
+          (function collect(o){
+            if(!o || typeof o !== "object") return;
+            if(Array.isArray(o)){ o.forEach(collect); return; }
+            objs.push(o);
+            if(o["@graph"]) collect(o["@graph"]);
+          })(data);
+          objs.forEach(function(o){
+            var t = o["@type"] || "";
+            if(/VideoObject/i.test(t)){
+              var th = o.thumbnailUrl;
+              if(Array.isArray(th)) th = th[0];
+              if(o.contentUrl) push(o.contentUrl, "Page's featured video", true, th || "");
+              if(o.embedUrl && isMedia(o.embedUrl)) push(o.embedUrl, "Embedded player", false, th || "");
+              if(th && !pageThumb){
+                try{ pageThumb = new URL(th, pageUrl).href; }catch(e){}
+              }
+            }
+          });
+        }catch(e){}
+      });
       doc.querySelectorAll("video, audio").forEach(function(v){
-        if(v.getAttribute("src")) push(v.getAttribute("src"), "Embedded player", false);
+        var poster = v.getAttribute("poster") || "";
+        var posterAbs = "";
+        if(poster){ try{ posterAbs = new URL(poster, pageUrl).href; }catch(e){} }
+        if(v.getAttribute("src")) push(v.getAttribute("src"), "Embedded player", false, posterAbs);
         v.querySelectorAll("source").forEach(function(s){
-          push(s.getAttribute("src"), "Embedded player", false);
+          push(s.getAttribute("src"), "Embedded player", false, posterAbs);
         });
       });
       doc.querySelectorAll("a[href]").forEach(function(a){
         var href = a.getAttribute("href");
-        if(href && (isMedia(href) || isStream(href))) push(href, "Link on the page", false);
+        if(href && (isMedia(href) || isStream(href) || isDash(href))) push(href, "Link on the page", false);
       });
     }
     // Scan the raw text for media file URLs (players often hide them in
     // scripts, and text-based copies of the page only have these).
-    var re = /https?:\\?\/\\?\/[^\s"'<>\\]+?\.(?:mp4|webm|mov|m4v|m3u8)(?:\?[^\s"'<>\\]*)?/gi;
+    var re = /https?:\\?\/\\?\/[^\s"'<>\\]+?\.(?:mp4|webm|mov|m4v|m3u8|mpd)(?:\?[^\s"'<>\\]*)?/gi;
     var m;
     while((m = re.exec(html)) !== null){
       push(m[0].replace(/\\\//g, "/").replace(/&amp;/g, "&"), "Found in page code", false);
     }
-    found.sort(function(a,b){ return (b.main?1:0) - (a.main?1:0); });
+    found.sort(function(a, b){ return (b.main ? 1 : 0) - (a.main ? 1 : 0); });
+    found.pageThumb = pageThumb;
     return found;
   }
   function run(){
@@ -480,7 +795,12 @@
       return;
     }
     if(isStream(pageUrl)){
-      setStatus("That's a live-stream link (.m3u8) — those don't save as a single file here.", "err");
+      setStatus("That's a streamed video (HLS) — downloading it in pieces and joining them …");
+      downloadHls(pageUrl).finally(function(){ goBtn.disabled = false; });
+      return;
+    }
+    if(isDash(pageUrl)){
+      setStatus("That's a DASH stream manifest (.mpd) — DASH isn't supported yet. If the page also offers an MP4 or HLS version, paste the page link instead.", "err");
       goBtn.disabled = false;
       return;
     }
@@ -496,8 +816,9 @@
         return;
       }
       setStatus("Found " + videos.length + (videos.length === 1 ? " video" : " videos") + " — pick one to download.", "ok");
-      videos.forEach(function(v){ addResult(v.url, v.source, v.main); });
-      var first = videos.filter(function(v){ return !isStream(v.url); })[0];
+      var pageThumb = videos.pageThumb || "";
+      videos.forEach(function(v){ addResult(v, pageThumb); });
+      var first = videos.filter(function(v){ return !isStream(v.url) && !isDash(v.url); })[0];
       if(videos.length === 1 && first){
         download(first.url);
       }
@@ -508,8 +829,7 @@
   goBtn.addEventListener("click", run);
   input.addEventListener("keydown", function(e){ if(e.key === "Enter") run(); });
   input.addEventListener("paste", function(){
-    setTimeout(function(){ if(input.value.trim()) run(); }, 50);
-  });
+    setTimeout(function(){ if(input.value.trim()) run(); }, 50); });
 })();
 </script>
 </body>
