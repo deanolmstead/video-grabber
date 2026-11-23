@@ -203,7 +203,8 @@
       url,
       "https://api.cors.lol/?url=" + encodeURIComponent(url),
       "https://api.allorigins.win/raw?url=" + encodeURIComponent(url),
-      "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url)
+      "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url),
+      "https://corsproxy.org/?url=" + encodeURIComponent(url)
     ];
   }
   function textRoutes(url){
@@ -238,11 +239,11 @@
         resolve(val);
       }
       var deadline = setTimeout(function(){ finish(undefined); }, deadlineMs);
-      handles.forEach(function(h){
+      handles.forEach(function(h, idx){
         h.promise.then(function(res){
           if(done) return;
           if(!res.ok){ throw new Error("HTTP " + res.status); }
-          var val = onResponse(res);
+          var val = onResponse(res, idx);
           if(val && typeof val.then === "function"){
             // A route has committed (e.g. a download is streaming) — the
             // answer deadline no longer applies; the handler decides.
@@ -268,13 +269,22 @@
   function fetchPage(pageUrl){
     // Resolve as soon as any route's copy of the page yields a video;
     // otherwise keep the longest readable copy for the "no video" verdict.
+    // Remembers which route got through — free relays often rate-limit a
+    // second hit, so the download step tries that route last.
     var bestText = null;
-    return raceRoutes(textRoutes(pageUrl), 30000, function(res){
+    var routes = textRoutes(pageUrl);
+    return raceRoutes(routes, 30000, function(res, idx){
       return res.text().then(function(text){
         if(!text || text.length < 80) return undefined;
-        if(bestText === null || text.length > bestText.length) bestText = text;
+        if(bestText === null || text.length > bestText.length){
+          bestText = text;
+          window.__vgPageRouteUrl = routes[idx];
+        }
         var videos = findVideos(text, pageUrl);
-        if(videos.length) return {text: text, videos: videos};
+        if(videos.length){
+          window.__vgPageRouteUrl = routes[idx];
+          return {text: text, videos: videos};
+        }
         return undefined;
       });
     }).then(function(hit){
@@ -293,7 +303,7 @@
     a.remove();
     setTimeout(function(){ URL.revokeObjectURL(objUrl); }, 4000);
   }
-  function streamToBlob(res, filename){
+  function streamWithStallWatch(res, filename){
     var total = parseInt(res.headers.get("Content-Length") || "0", 10);
     if(!res.body || !total){
       return res.blob().then(function(b){ saveBlob(b, filename); });
@@ -301,8 +311,11 @@
     var reader = res.body.getReader();
     var chunks = [], received = 0;
     setProgress(0);
-    function pump(){
-      return reader.read().then(function(step){
+    function readChunk(){
+      var stall = new Promise(function(_, reject){
+        setTimeout(function(){ reject(new Error("stalled")); }, 20000);
+      });
+      return Promise.race([reader.read(), stall]).then(function(step){
         if(step.done){
           setProgress(null);
           saveBlob(new Blob(chunks), filename);
@@ -311,31 +324,64 @@
         chunks.push(step.value);
         received += step.value.length;
         setProgress(Math.min(received/total, 1));
-        return pump();
+        return readChunk();
       });
     }
-    return pump();
+    return readChunk().catch(function(err){
+      try{ reader.cancel(); }catch(e){}
+      setProgress(null);
+      throw err;
+    });
+  }
+  function showOpenLink(url){
+    // Popup blockers kill window.open() after long async work, so leave a
+    // real link the user can tap instead.
+    var div = document.createElement("div");
+    div.className = "found";
+    var a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "Open the video directly — then right-click it (or long-press) and choose “Save video as…”";
+    div.appendChild(a);
+    resultsEl.appendChild(div);
   }
   function download(url){
+    // Downloads go one route at a time with fast failover: free relays
+    // rate-limit and stall on binary files, and a single hanging route
+    // must not poison the whole attempt.
     var filename = filenameFor(url);
-    setStatus("Downloading " + filename + " — trying every route at once …");
+    var routes = relayRoutes(url);
+    var usedUrl = window.__vgPageRouteUrl;
+    if(usedUrl){
+      routes = routes.filter(function(r){ return r !== usedUrl; })
+        .concat(routes.filter(function(r){ return r === usedUrl; }));
+    }
     setProgress(0.02);
-    // First route to answer with an OK wins; stream the file from it.
-    // (The 30s cap is on getting an answer, not on the download itself.)
-    var saved = raceRoutes(relayRoutes(url), 30000, function(res){
-      var name = filenameFor(url, res.headers.get("Content-Type") || "");
-      return streamToBlob(res, name).then(function(){ return name; });
-    });
-    return saved.then(function(name){
-      setProgress(null);
-      if(name){
+    function attempt(i){
+      if(i >= routes.length){
+        setProgress(null);
+        setStatus("Every route was blocked, busy or stalled on the file itself. Use the direct link below, or wait a minute and try again.", "err");
+        showOpenLink(url);
+        return Promise.resolve(false);
+      }
+      setStatus("Downloading " + filename + " — route " + (i+1) + " of " + routes.length + " …");
+      var ctrl = new AbortController();
+      var headerTimer = setTimeout(function(){ ctrl.abort(); }, 15000);
+      return fetch(routes[i], {signal: ctrl.signal}).then(function(res){
+        clearTimeout(headerTimer);
+        if(!res.ok) throw new Error("HTTP " + res.status);
+        var name = filenameFor(url, res.headers.get("Content-Type") || "");
+        return streamWithStallWatch(res, name).then(function(){ return name; });
+      }).then(function(name){
+        setProgress(null);
         setStatus("Saved " + name + " — check your downloads.", "ok");
         return true;
-      }
-      setStatus("Every route was blocked or busy. Wait a minute and try again — or open the video in your browser and right-click → “Save video as…”. Opening it now.", "err");
-      window.open(url, "_blank");
-      return false;
-    });
+      }).catch(function(){
+        return attempt(i + 1);
+      });
+    }
+    return attempt(0);
   }
   function addResult(url, source, isMain){
     var div = document.createElement("div");
