@@ -613,17 +613,23 @@
   }
 
   // ---------- Results list ----------
-  function grabFrame(url, img){
-    // No poster or page image? Pull a frame from the video itself,
-    // streamed through the proxy, and use it as the thumbnail.
+  function grabFrame(url, img, fallback){
+    // No poster? Pull a frame from the video itself, streamed through
+    // the proxy. If that fails, fall back to the page's own image.
     var v = document.createElement("video");
     var done = false;
+    var got = false;
     var timer = setTimeout(cleanup, 12000);
     function cleanup(){
       if(done) return;
       done = true;
       clearTimeout(timer);
       try{ v.removeAttribute("src"); v.load(); }catch(e){}
+      if(!got && fallback){
+        img.src = fallback;
+        img.style.display = "block";
+        img.onerror = function(){ img.style.display = "none"; };
+      }
     }
     v.muted = true;
     v.preload = "auto";
@@ -643,6 +649,7 @@
           ctx.drawImage(v, (160 - w) / 2, (90 - h) / 2, w, h);
           img.src = c.toDataURL("image/jpeg", 0.7);
           img.style.display = "block";
+          got = true;
         }
       }catch(e){}
       cleanup();
@@ -657,9 +664,11 @@
     var img = document.createElement("img");
     img.className = "thumb";
     img.alt = "";
-    var thumb = item.thumb || pageThumb || "";
-    if(thumb){
-      img.src = thumb;
+    // A poster from the page wins. Otherwise grab a real frame from the
+    // video; the page's share image is only the fallback — it's often a
+    // generic banner that says nothing about the video itself.
+    if(item.thumb){
+      img.src = item.thumb;
       img.style.display = "block";
       img.onerror = function(){ img.style.display = "none"; };
     }
@@ -684,6 +693,11 @@
       note.style.color = "var(--warn)";
       note.textContent = "DASH stream — not supported yet.";
       div.appendChild(note);
+      if(!item.thumb && pageThumb){
+        img.src = pageThumb;
+        img.style.display = "block";
+        img.onerror = function(){ img.style.display = "none"; };
+      }
     } else {
       var btn = document.createElement("button");
       btn.textContent = "Download";
@@ -692,7 +706,12 @@
         else download(url);
       });
       div.appendChild(btn);
-      if(!thumb && isMedia(url)) grabFrame(url, img);
+      if(!item.thumb && isMedia(url)) grabFrame(url, img, pageThumb);
+      else if(!item.thumb && pageThumb){
+        img.src = pageThumb;
+        img.style.display = "block";
+        img.onerror = function(){ img.style.display = "none"; };
+      }
     }
     resultsEl.appendChild(div);
   }
