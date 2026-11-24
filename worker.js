@@ -102,6 +102,12 @@ function extractMedia(html, pageUrl) {
   while ((m = re.exec(html)) !== null) {
     push(m[0].replace(/\\\//g, "/").replace(/&amp;/g, "&"), false);
   }
+  // Quoted paths, including relative ones (src="/html/mov_bbb.mp4") that
+  // only resolve against the page URL — push() handles the resolution.
+  const qre = /["']([^"'\s]+\.(?:mp4|webm|mov|m4v|m3u8)(?:\?[^"'\s]*)?)["']/gi;
+  while ((m = qre.exec(html)) !== null) {
+    push(m[1].replace(/&amp;/g, "&"), false);
+  }
   function score(f) {
     if (f.main) return 1000000000;
     let s = 0;
