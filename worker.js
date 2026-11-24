@@ -5,6 +5,7 @@
 // Session mode exists for sites that sign their file links for the session
 // (IP + cookies) that loaded the page: page and file are fetched here,
 // back to back, so the signature matches.
+// Deployed via Cloudflare Workers Builds from the video-grabber repo (main).
 const ALLOWED_ORIGIN = "https://deanolmstead.github.io";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
