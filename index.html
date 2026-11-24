@@ -91,6 +91,7 @@
     border:1px solid var(--border);
   }
   .found .meta{flex:1 1 240px;min-width:0}
+  .found .sess{display:inline-block;margin-top:.35rem;font-size:.85rem}
   .found .fname{font-weight:700;word-break:break-all}
   .found .furl{color:var(--muted);font-size:.82rem;word-break:break-all}
   .tag{
@@ -130,6 +131,7 @@
       <li><strong>Works:</strong> direct video files (.mp4, .webm, .mov), pages that embed a plain video file — news clips, product videos, blog posts, most smaller sites — and streamed videos (HLS / .m3u8), which are downloaded in pieces and joined into a single MP4.</li>
       <li><strong>Won't work:</strong> YouTube, Vimeo, Netflix, Facebook, Instagram, TikTok and other streaming/social services, and DRM-encrypted streams. They never expose a plain video file, so there's nothing here to grab.</li>
       <li>Most sites block other sites from reading their pages, so this tool fetches through a small private proxy first, with several public relay services as backup. If every route is blocked or busy, wait a minute and try again — or paste the video's direct file link, which always works.</li>
+      <li>Some sites lock their video links to the exact session that viewed the page, so no relay can fetch them. For those, each result has a <strong>Session download</strong> link: it reloads the page and pulls the file in one session, the same trick the big download services use.</li>
       <li>Only download videos you have the right to keep.</li>
     </ul>
   </div>
@@ -215,7 +217,8 @@
     return n + " B";
   }
   // Relay services that will fetch a URL on our behalf. Tried in parallel.
-  var PROXY = "https://video-grabber-proxy.deanolmstead.workers.dev/?url=";
+  var WORKER = "https://video-grabber-proxy.deanolmstead.workers.dev/";
+  var PROXY = WORKER + "?url=";
   function relayRoutes(url){
     return [
       PROXY + encodeURIComponent(url),
@@ -405,7 +408,10 @@
     function attempt(i){
       if(i >= routes.length){
         setProgress(null);
-        setStatus("Every route was blocked, busy or stalled on the file itself. Use the direct link below, or wait a minute and try again.", "err");
+        setStatus("Every route was blocked, busy or stalled on the file itself." +
+          (window.__vgLastPage
+            ? " This site may lock its links to the viewing session — try the Session download link on the video above."
+            : " Use the direct link below, or wait a minute and try again."), "err");
         showOpenLink(url);
         return Promise.resolve(false);
       }
@@ -687,6 +693,15 @@
     furl.textContent = item.source + " — " + url;
     meta.appendChild(fname);
     meta.appendChild(furl);
+    if(window.__vgLastPage && !isDash(url)){
+      var sess = document.createElement("a");
+      sess.className = "sess";
+      sess.href = WORKER + "?grab=" + encodeURIComponent(window.__vgLastPage);
+      sess.target = "_blank";
+      sess.rel = "noopener";
+      sess.textContent = "Session download — for sites that lock the link to your visit";
+      meta.appendChild(sess);
+    }
     div.appendChild(meta);
     if(isDash(url)){
       var note = document.createElement("span");
@@ -824,6 +839,7 @@
       return;
     }
     setStatus("Reading the page through several relays at once, looking for its video …");
+    window.__vgLastPage = pageUrl;
     fetchPage(pageUrl).then(function(result){
       if(!result){
         setStatus("Couldn't read that page — every relay was blocked or busy. Wait a minute and try again. If the video itself has a direct file link, pasting that always works.", "err");
